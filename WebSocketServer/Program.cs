@@ -16,6 +16,7 @@ class WebSocketServer
     private char[,] playerMap2 = new char[10, 10];
     private int _currentTurn = 1;
     private readonly HashSet<int> readyPlayers = new HashSet<int>();
+    private readonly Dictionary<WebSocket, bool> _playerReadyStates = new Dictionary<WebSocket, bool>();
 
     public WebSocketServer(string uri)
     {
@@ -98,13 +99,28 @@ class WebSocketServer
                 }
                 else if (message.StartsWith("SHOT:"))
                 {
-                    await HandleShotMessage(message.Substring(5), playerNumber);
+                    // Handle SHOT only if both players are ready
+                    if (readyPlayers.Count == 2)
+                    {
+                        await HandleShotMessage(message.Substring(5), playerNumber);
+                    }
+                    else
+                    {
+                        // Notify the player they can't shoot yet
+                        await clientSocket.SendAsync(
+                            new ArraySegment<byte>(Encoding.UTF8.GetBytes("GAME_NOT_READY")),
+                            WebSocketMessageType.Text,
+                            true,
+                            CancellationToken.None
+                        );
+                    }
                 }
                 else if (message == "READY")
                 {
                     readyPlayers.Add(playerNumber);
                     Console.WriteLine($"Player {playerNumber} is ready.");
 
+                    // If both players are ready, start the game
                     if (readyPlayers.Count == 2)
                     {
                         Console.WriteLine("Both players are ready. Starting the game!");
@@ -131,6 +147,7 @@ class WebSocketServer
             }
         }
     }
+
     private async Task HandleMapMessage(string serializedMap, int playerNumber)
     {
         try
