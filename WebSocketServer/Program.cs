@@ -112,6 +112,18 @@ class WebSocketServer
                         await BroadcastTurn();
                     }
                 }
+                else if (message == "REMATCH_REQUEST")
+                {
+                    BroadcastToOtherPlayer(playerNumber, "REMATCH_REQUEST");
+                }
+                else if (message == "REMATCH_ACCEPT")
+                {
+                    BroadcastToOtherPlayer(playerNumber, "REMATCH_ACCEPT");
+                }
+                else if (message == "REMATCH_REJECT")
+                {
+                    BroadcastToOtherPlayer(playerNumber, "REMATCH_REJECT");
+                }
             }
             catch (Exception ex)
             {
@@ -230,6 +242,48 @@ class WebSocketServer
         }
     }
 
+
+    private async Task BroadcastToOtherPlayer(int playerNumber, string message)
+    {
+        // Find the other player's WebSocket connection
+        var otherPlayerSocket = GetOtherPlayerSocket(playerNumber);
+
+        // If the other player's socket exists and is open, send the message
+        if (otherPlayerSocket != null && otherPlayerSocket.State == WebSocketState.Open)
+        {
+            try
+            {
+                await otherPlayerSocket.SendAsync(
+                    new ArraySegment<byte>(Encoding.UTF8.GetBytes(message)),
+                    WebSocketMessageType.Text,
+                    true,
+                    CancellationToken.None
+                );
+                Console.WriteLine($"Message sent to other player: {message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending message to other player: {ex.Message}");
+            }
+        }
+        else
+        {
+            Console.WriteLine("Other player's socket is not available or not open.");
+        }
+    }
+
+    private WebSocket GetOtherPlayerSocket(int playerNumber)
+    {
+        // Iterate through connected clients to find the opponent
+        foreach (var kvp in _connectedClients)
+        {
+            if (kvp.Value != playerNumber) // Opponent's socket
+            {
+                return kvp.Key;
+            }
+        }
+        return null; // No opponent found
+    }
 
     private bool AreAllShipsSunk(char[,] map)
     {
