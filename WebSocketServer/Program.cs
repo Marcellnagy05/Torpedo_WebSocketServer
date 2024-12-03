@@ -187,39 +187,67 @@ class WebSocketServer
 
         Console.WriteLine($"[DEBUG] Player {playerNumber} fired at ({row}, {col}).");
 
-        // Log the target map before processing the shot
-        Console.WriteLine("[DEBUG] Target map before processing shot:");
-        PrintMap(targetMap);
-
-        Console.WriteLine($"[DEBUG] Target cell before shot: '{targetMap[row, col]}'");
-
         string result;
-        if (targetMap[row, col] == '1')  // Ships marked with 'S'
+        if (targetMap[row, col] == '1')  // Ship
         {
             result = "HIT";
             targetMap[row, col] = 'H';  // Mark as hit
         }
-        else if (targetMap[row, col] == 'E' || targetMap[row, col] == 'X')  // Water marked with 'E'
+        else if (targetMap[row, col] == 'E')  // Water
         {
             result = "MISS";
             targetMap[row, col] = 'M';  // Mark as miss
         }
         else
         {
-            result = "INVALID";  // Already hit or invalid
+            result = "INVALID"; // Already hit or invalid
         }
 
         Console.WriteLine($"[DEBUG] Shot result: {result}");
         Console.WriteLine($"[DEBUG] Target cell after shot: '{targetMap[row, col]}'");
 
+        // Broadcast the shot result
         string resultMessage = $"SHOT_RESULT:{row},{col},{result}";
         await BroadcastToAll(resultMessage);
 
-        _currentTurn = playerNumber == 1 ? 2 : 1;
-        await BroadcastTurn();
+        // Check if the game is over (opponent's ships are all sunk)
+        if (AreAllShipsSunk(targetMap))
+        {
+            // Send game over message to both players
+            string gameOverMessage = "Game Over!";
+
+            await BroadcastToAll(gameOverMessage);
+
+            // End the game (you can stop further game logic or leave as a flag for the client to handle)
+            return;
+        }
+
+        // Only switch turns if the shot was a miss or invalid
+        if (result != "HIT")
+        {
+            _currentTurn = playerNumber == 1 ? 2 : 1;
+            await BroadcastTurn();
+        }
     }
 
 
+    private bool AreAllShipsSunk(char[,] map)
+    {
+        // Count how many ships are still left on the map (i.e., 'S')
+        int remainingShips = 0;
+        for (int row = 0; row < 10; row++)
+        {
+            for (int col = 0; col < 10; col++)
+            {
+                if (map[row, col] == '1')
+                {
+                    remainingShips++;
+                }
+            }
+        }
+
+        return remainingShips == 0;
+    }
 
     private async Task BroadcastToAll(string message)
     {
