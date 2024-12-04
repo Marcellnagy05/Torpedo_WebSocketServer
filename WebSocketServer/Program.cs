@@ -87,6 +87,9 @@ class WebSocketServer
                     if (readyPlayers.Count == 2)
                     {
                         await HandleShotMessage(message.Substring(5), playerNumber);
+
+                        await PreloadOpponentMap(1);
+                        await PreloadOpponentMap(2);
                     }
                     else
                     {
@@ -191,8 +194,8 @@ class WebSocketServer
         var parts = shotCoordinates.Split(',');
         int row = int.Parse(parts[0]);
         int col = int.Parse(parts[1]);
-        char[,] targetMap = playerNumber == 1 ? playerMap2 : playerMap1;
-        var opponentShips = _playerShips[playerNumber == 1 ? 2 : 1];
+        char[,] targetMap = playerNumber == 1 ? playerMap2 : playerMap1; // Target map (Player 2's map if Player 1 is firing)
+        var opponentShips = _playerShips[playerNumber == 1 ? 2 : 1]; // Get opponent's ships (Player 2's ships if Player 1 is firing)
 
         Console.WriteLine($"[DEBUG] Player {playerNumber} fired at ({row}, {col}).");
 
@@ -208,24 +211,20 @@ class WebSocketServer
 
             if (hitShip != null && hitShip.CheckIfSunk(targetMap))
             {
-                result = "SUNK";
                 hitShip.IsSunk = true;
 
-                // Mark adjacent tiles as unavailable
-                MarkAdjacentTiles(targetMap, hitShip);
-
-                // Send the positions of the sunk ship in a separate message
+                // Include alignment in the sunk ship message
+                string isHorizontal = hitShip.IsRow ? "true" : "false";
                 string sunkShipPositions = string.Join(";", hitShip.Positions.Select(p => $"{p.Row},{p.Col}"));
-                string sunkMessage = $"SUNK_SHIP:{sunkShipPositions}";
+                string sunkMessage = $"SUNK_SHIP:{sunkShipPositions}|{isHorizontal}";
+
                 await BroadcastToAll(sunkMessage);
-            }
-            else
-            {
-                result = "HIT";
-                targetMap[row, col] = 'H'; // Mark as hit
+
+                // Mark adjacent tiles for both players
+                await MarkAdjacentTilesForBothPlayers(targetMap, hitShip, playerNumber);
             }
         }
-        else if (targetMap[row, col] == 'E') // Water
+        else if (targetMap[row, col] == 'E' || targetMap[row, col] == 'X') // Water
         {
             result = "MISS";
             targetMap[row, col] = 'M'; // Mark as miss
@@ -253,13 +252,58 @@ class WebSocketServer
         }
     }
 
-    private void MarkAdjacentTiles(char[,] map, Ship ship)
+    private async Task PreloadOpponentMap(int playerNumber)
     {
+        var sourceMap = playerNumber == 1 ? playerMap1 : playerMap2;
+
+        // Create a map representation that includes both ships ('1') and unavailable tiles ('X')
+        var preloadData = new List<string>();
+        for (int row = 0; row < sourceMap.GetLength(0); row++)
+        {
+            var rowData = new StringBuilder();
+            for (int col = 0; col < sourceMap.GetLength(1); col++)
+            {
+                // Include '1' for ships and 'X' for unavailable tiles, otherwise mark as empty ('E')
+                if (sourceMap[row, col] == '1')
+                {
+                    rowData.Append('1'); // Mark ship
+                }
+                else if (sourceMap[row, col] == 'X')
+                {
+                    rowData.Append('X'); // Mark unavailable tile
+                }
+                else
+                {
+                    rowData.Append('E'); // Empty
+                }
+            }
+            preloadData.Add(rowData.ToString());
+        }
+
+        // Serialize and send the preload data
+        string preloadMessage = $"PRELOAD_MAP:{JsonSerializer.Serialize(preloadData)}";
+        var opponentSocket = GetOtherPlayerSocket(playerNumber);
+        if (opponentSocket?.State == WebSocketState.Open)
+        {
+            await opponentSocket.SendAsync(
+                new ArraySegment<byte>(Encoding.UTF8.GetBytes(preloadMessage)),
+                WebSocketMessageType.Text,
+                true,
+                CancellationToken.None
+            );
+        }
+    }
+
+    private async Task MarkAdjacentTilesForBothPlayers(char[,] map, Ship ship, int playerNumber)
+    {
+        List<(int Row, int Col)> markedPositions = new List<(int Row, int Col)>();
+
         foreach (var position in ship.Positions)
         {
             int startRow = position.Row;
             int startCol = position.Col;
 
+            // Iterate through all adjacent cells (including diagonals)
             for (int dr = -1; dr <= 1; dr++)
             {
                 for (int dc = -1; dc <= 1; dc++)
@@ -272,9 +316,39 @@ class WebSocketServer
                         if (map[adjRow, adjCol] == 'E') // Only mark empty tiles as unavailable
                         {
                             map[adjRow, adjCol] = 'X'; // Mark as unavailable
+                            markedPositions.Add((adjRow, adjCol)); // Collect marked position
                         }
                     }
                 }
+            }
+        }
+
+        // Notify both players about the marked positions (shooter and defender)
+        await SendMarkedPositionsToClients(markedPositions, playerNumber);
+    }
+
+    private async Task SendMarkedPositionsToClients(List<(int Row, int Col)> markedPositions, int playerNumber)
+    {
+        if (markedPositions.Count > 0)
+        {
+            // Format the marked positions as a string: "MARKED_POSITIONS:row1,col1;row2,col2;..."
+            string markedPositionsMessage = "MARKED_POSITIONS:" + string.Join(";", markedPositions.Select(pos => $"{pos.Row},{pos.Col}"));
+
+            // Find the correct WebSocket for the current player and the opponent
+            var shooterSocket = _connectedClients.FirstOrDefault(c => c.Value == playerNumber).Key;
+            var opponentSocket = _connectedClients.FirstOrDefault(c => c.Value != playerNumber).Key;
+
+            // Send the marked positions message to both the shooter and the defender
+            var messageBuffer = Encoding.UTF8.GetBytes(markedPositionsMessage);
+
+            if (shooterSocket?.State == WebSocketState.Open)
+            {
+                await shooterSocket.SendAsync(new ArraySegment<byte>(messageBuffer), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+
+            if (opponentSocket?.State == WebSocketState.Open)
+            {
+                await opponentSocket.SendAsync(new ArraySegment<byte>(messageBuffer), WebSocketMessageType.Text, true, CancellationToken.None);
             }
         }
     }
