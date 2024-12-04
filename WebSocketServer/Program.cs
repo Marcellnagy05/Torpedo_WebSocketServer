@@ -1,12 +1,8 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Net;
+﻿using System.Collections.Concurrent;
 using System.Net.WebSockets;
-using System.Text;
+using System.Net;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Collections.Generic;
+using System.Text;
 
 class WebSocketServer
 {
@@ -17,6 +13,7 @@ class WebSocketServer
     private int _currentTurn = 1;
     private readonly HashSet<int> readyPlayers = new HashSet<int>();
     private readonly Dictionary<WebSocket, bool> _playerReadyStates = new Dictionary<WebSocket, bool>();
+    private readonly ConcurrentDictionary<int, List<Ship>> _playerShips = new ConcurrentDictionary<int, List<Ship>>();
 
     public WebSocketServer(string uri)
     {
@@ -60,18 +57,6 @@ class WebSocketServer
         }
     }
 
-    private void PrintMap(char[,] map)
-    {
-        for (int row = 0; row < map.GetLength(0); row++)
-        {
-            for (int col = 0; col < map.GetLength(1); col++)
-            {
-                Console.Write(map[row, col] == '\0' ? 'E' : map[row, col]);
-            }
-            Console.WriteLine();
-        }
-    }
-
     private async Task HandleClient(WebSocket clientSocket, int playerNumber)
     {
         var buffer = new byte[4096];
@@ -99,14 +84,12 @@ class WebSocketServer
                 }
                 else if (message.StartsWith("SHOT:"))
                 {
-                    // Handle SHOT only if both players are ready
                     if (readyPlayers.Count == 2)
                     {
                         await HandleShotMessage(message.Substring(5), playerNumber);
                     }
                     else
                     {
-                        // Notify the player they can't shoot yet
                         await clientSocket.SendAsync(
                             new ArraySegment<byte>(Encoding.UTF8.GetBytes("GAME_NOT_READY")),
                             WebSocketMessageType.Text,
@@ -120,7 +103,6 @@ class WebSocketServer
                     readyPlayers.Add(playerNumber);
                     Console.WriteLine($"Player {playerNumber} is ready.");
 
-                    // If both players are ready, start the game
                     if (readyPlayers.Count == 2)
                     {
                         Console.WriteLine("Both players are ready. Starting the game!");
@@ -154,52 +136,49 @@ class WebSocketServer
         {
             Console.WriteLine($"[DEBUG] Raw map received from Player {playerNumber}: {serializedMap}");
 
-            // Deserialize the incoming map data (JSON string to List<string>)
             var mapMessage = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(serializedMap);
-
-            if (mapMessage == null)
-            {
-                Console.WriteLine("[ERROR] Failed to deserialize map message.");
-                return;
-            }
-
-            // Extract the "Map" field and deserialize it to a List<string>
             var mapData = mapMessage["Map"].Deserialize<List<string>>();
 
-            if (mapData == null || mapData.Count != 10 || mapData.Any(row => row.Length != 10))
-            {
-                Console.WriteLine($"[ERROR] Invalid map format received from Player {playerNumber}. Map has {mapData?.Count} rows and expected 10.");
-                return;
-            }
-
-            Console.WriteLine("[DEBUG] Map data after deserialization:");
-            foreach (var row in mapData)
-            {
-                Console.WriteLine(row);  // Print each row of the map to debug
-            }
-
-            // Determine which player's map to update
             char[,] targetMap = playerNumber == 1 ? playerMap1 : playerMap2;
+            var playerShips = new List<Ship>();
 
-            // Populate the target map with the data
             for (int row = 0; row < 10; row++)
             {
                 for (int col = 0; col < 10; col++)
                 {
-                    targetMap[row, col] = mapData[row][col];  // Set each cell in the map
+                    targetMap[row, col] = mapData[row][col];
+
+                    if (mapData[row][col] == '1') // Part of a ship
+                    {
+                        var existingShip = playerShips.FirstOrDefault(ship =>
+                            ship.Positions.Any(pos =>
+                                (pos.Row == row && Math.Abs(pos.Col - col) == 1) || // Horizontally adjacent
+                                (pos.Col == col && Math.Abs(pos.Row - row) == 1))); // Vertically adjacent
+
+                        if (existingShip != null)
+                        {
+                            existingShip.Positions.Add((row, col));
+                        }
+                        else
+                        {
+                            playerShips.Add(new Ship
+                            {
+                                Length = 1,
+                                Positions = new List<(int Row, int Col)> { (row, col) }
+                            });
+                        }
+                    }
                 }
             }
 
-            // Log the map after it's been populated
-            Console.WriteLine($"[DEBUG] Player {playerNumber}'s map initialized:");
-            PrintMap(targetMap);
+            _playerShips[playerNumber] = playerShips;
+            Console.WriteLine($"[DEBUG] Player {playerNumber}'s ships initialized.");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] Failed to process map from Player {playerNumber}: {ex.Message}");
         }
     }
-
 
     private async Task HandleShotMessage(string shotCoordinates, int playerNumber)
     {
@@ -213,19 +192,43 @@ class WebSocketServer
         int row = int.Parse(parts[0]);
         int col = int.Parse(parts[1]);
         char[,] targetMap = playerNumber == 1 ? playerMap2 : playerMap1;
+        var opponentShips = _playerShips[playerNumber == 1 ? 2 : 1];
 
         Console.WriteLine($"[DEBUG] Player {playerNumber} fired at ({row}, {col}).");
 
         string result;
-        if (targetMap[row, col] == '1')  // Ship
+        if (targetMap[row, col] == '1') // Hit a ship
         {
             result = "HIT";
-            targetMap[row, col] = 'H';  // Mark as hit
+            targetMap[row, col] = 'H'; // Mark as hit
+
+            // Check if the hit ship is sunk
+            var hitShip = opponentShips.FirstOrDefault(ship =>
+                ship.Positions.Any(pos => pos.Row == row && pos.Col == col));
+
+            if (hitShip != null && hitShip.CheckIfSunk(targetMap))
+            {
+                result = "SUNK";
+                hitShip.IsSunk = true;
+
+                // Mark adjacent tiles as unavailable
+                MarkAdjacentTiles(targetMap, hitShip);
+
+                // Send the positions of the sunk ship in a separate message
+                string sunkShipPositions = string.Join(";", hitShip.Positions.Select(p => $"{p.Row},{p.Col}"));
+                string sunkMessage = $"SUNK_SHIP:{sunkShipPositions}";
+                await BroadcastToAll(sunkMessage);
+            }
+            else
+            {
+                result = "HIT";
+                targetMap[row, col] = 'H'; // Mark as hit
+            }
         }
-        else if (targetMap[row, col] == 'E')  // Water
+        else if (targetMap[row, col] == 'E') // Water
         {
             result = "MISS";
-            targetMap[row, col] = 'M';  // Mark as miss
+            targetMap[row, col] = 'M'; // Mark as miss
         }
         else
         {
@@ -233,25 +236,16 @@ class WebSocketServer
         }
 
         Console.WriteLine($"[DEBUG] Shot result: {result}");
-        Console.WriteLine($"[DEBUG] Target cell after shot: '{targetMap[row, col]}'");
+        await BroadcastToAll($"SHOT_RESULT:{row},{col},{result}");
 
-        // Broadcast the shot result
-        string resultMessage = $"SHOT_RESULT:{row},{col},{result}";
-        await BroadcastToAll(resultMessage);
-
-        // Check if the game is over (opponent's ships are all sunk)
+        // Check if all ships are sunk
         if (AreAllShipsSunk(targetMap))
         {
-            // Send game over message to both players
-            string gameOverMessage = "Game Over!";
-
-            await BroadcastToAll(gameOverMessage);
-
-            // End the game (you can stop further game logic or leave as a flag for the client to handle)
+            await BroadcastToAll("Game Over!");
             return;
         }
 
-        // Only switch turns if the shot was a miss or invalid
+        // Switch turns if the shot was not a hit
         if (result != "HIT")
         {
             _currentTurn = playerNumber == 1 ? 2 : 1;
@@ -259,13 +253,36 @@ class WebSocketServer
         }
     }
 
+    private void MarkAdjacentTiles(char[,] map, Ship ship)
+    {
+        foreach (var position in ship.Positions)
+        {
+            int startRow = position.Row;
+            int startCol = position.Col;
+
+            for (int dr = -1; dr <= 1; dr++)
+            {
+                for (int dc = -1; dc <= 1; dc++)
+                {
+                    int adjRow = startRow + dr;
+                    int adjCol = startCol + dc;
+
+                    if (adjRow >= 0 && adjRow < map.GetLength(0) && adjCol >= 0 && adjCol < map.GetLength(1))
+                    {
+                        if (map[adjRow, adjCol] == 'E') // Only mark empty tiles as unavailable
+                        {
+                            map[adjRow, adjCol] = 'X'; // Mark as unavailable
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private async Task BroadcastToOtherPlayer(int playerNumber, string message)
     {
-        // Find the other player's WebSocket connection
         var otherPlayerSocket = GetOtherPlayerSocket(playerNumber);
 
-        // If the other player's socket exists and is open, send the message
         if (otherPlayerSocket != null && otherPlayerSocket.State == WebSocketState.Open)
         {
             try
@@ -291,20 +308,18 @@ class WebSocketServer
 
     private WebSocket GetOtherPlayerSocket(int playerNumber)
     {
-        // Iterate through connected clients to find the opponent
         foreach (var kvp in _connectedClients)
         {
-            if (kvp.Value != playerNumber) // Opponent's socket
+            if (kvp.Value != playerNumber)
             {
                 return kvp.Key;
             }
         }
-        return null; // No opponent found
+        return null;
     }
 
     private bool AreAllShipsSunk(char[,] map)
     {
-        // Count how many ships are still left on the map (i.e., 'S')
         int remainingShips = 0;
         for (int row = 0; row < 10; row++)
         {
@@ -350,6 +365,7 @@ class WebSocketServer
         }
     }
 }
+
 
 internal class Program
 {
